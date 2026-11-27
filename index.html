@@ -122,6 +122,14 @@ svg { display: block; }
   background: transparent; color: var(--dial-ink); font-weight: 600; font-size: 14px; text-decoration: none;
 }
 
+/* Sonando ahora (canción, artista y portada) */
+.now { display: flex; align-items: center; gap: 12px; margin: 14px 0 0; padding: 10px 14px 10px 10px; max-width: 520px; border-radius: 14px; background: rgba(255, 255, 255, .07); }
+.now img { width: 56px; height: 56px; flex: none; border-radius: 10px; object-fit: cover; background: var(--dial-line); }
+.now-text { display: grid; min-width: 0; }
+.now-label { font-size: 12px; font-weight: 600; color: var(--dial-soft); }
+.now-title { font-size: 16px; font-weight: 700; line-height: 1.25; overflow-wrap: anywhere; }
+.now-artist { font-size: 14px; color: var(--dial-soft); overflow-wrap: anywhere; }
+
 /* Dial */
 .dial { position: relative; height: 92px; margin: 14px 0 6px; touch-action: pan-y; cursor: grab; user-select: none; -webkit-user-select: none; border-radius: 10px; }
 .dial:active { cursor: grabbing; }
@@ -321,6 +329,14 @@ body.has-mini .toast { bottom: calc(96px + env(safe-area-inset-bottom, 0px)); }
     </div>
     <h2 class="station-name" id="sName">Sin sintonizar</h2>
     <p class="station-slogan" id="sSlogan">Arrastra la aguja por el dial o elige una emisora de la lista.</p>
+    <div class="now" id="now" aria-live="polite" hidden>
+      <img id="nowCover" alt="" width="56" height="56" hidden>
+      <div class="now-text">
+        <span class="now-label">Sonando ahora</span>
+        <span class="now-title" id="nowTitle"></span>
+        <span class="now-artist" id="nowArtist"></span>
+      </div>
+    </div>
     <p class="status" id="status" data-s="idle" aria-live="polite"></p>
 
     <div class="dial" id="dial" tabindex="0" role="slider" aria-label="Dial FM de Santiago" aria-valuemin="88" aria-valuemax="108" aria-valuenow="88" aria-valuetext="Sin sintonizar">
@@ -537,6 +553,16 @@ var STATIONS = [
   });
   var DIAL_STATIONS = STATIONS.filter(function (s) { return s.freq !== null; }).sort(function (a, b) { return a.freq - b.freq; });
   var F_MIN = 88, F_MAX = 108;
+
+  /* ---------- Sonando ahora: radios de StreamTheWorld publican la canción ----------
+     Clave = id de la emisora; valor = "mount" en np.tritondigital.com */
+  var NP_MOUNTS = {
+    radio_imagina: 'IMAGINA', radio_concierto: 'CONCIERTO', radio_futuro: 'FUTURO',
+    radio_pudahuel: 'PUDAHUEL', adn_radio: 'ADN', radio_activa: 'ACTIVA',
+    radio_rock_and_pop: 'ROCK_AND_POP', radio_fmdos: 'FMDOS', radio_corazon: 'CORAZON',
+    radio_los40: 'LOS40_CHILE'
+  };
+  var NP_EVERY = 20000; // ms entre consultas
   var CATEGORIES = ['Todas', 'Favoritas', 'Noticias', 'Música & Éxitos', 'Rock', 'Tropical & Cumbia', 'Romántica', 'Regiones', 'Mis emisoras'];
   var SLEEP_OPTIONS = [[15, '15 minutos'], [30, '30 minutos'], [45, '45 minutos'], [60, '1 hora'], [90, '1 hora 30 min'], [120, '2 horas']];
 
@@ -615,7 +641,10 @@ var STATIONS = [
   var hlsNative = audio.canPlayType('application/vnd.apple.mpegurl') !== '';
 
   function setStatus(s) {
+    var was = state.status;
     state.status = s;
+    if (s === 'playing' && (was !== 'playing' || !npTimer)) startNowPlaying();
+    else if (s === 'paused' || s === 'error' || s === 'idle') stopNowPlaying();
     if (s !== 'buffering') { clearTimeout(watchdog); watchdog = null; }
     renderAll();
     syncMediaSession();
@@ -679,6 +708,8 @@ var STATIONS = [
   }
   function play(st) {
     if (!st.url) { openSite(st); return; }
+    if (state.current !== st.id) nowPlaying = null; // otra radio: borra la canción anterior
+    stopNowPlaying();
     state.current = st.id;
     state.error = null;
     state.preview = null;
@@ -731,6 +762,55 @@ var STATIONS = [
     play(list[n]);
   }
 
+  /* ---------- Sonando ahora ---------- */
+  var nowPlaying = null, npTimer = null;
+  function npProp(xml, name) {
+    var el = xml.querySelector('property[name="' + name + '"]');
+    return el ? el.textContent.trim() : '';
+  }
+  function fetchNowPlaying() {
+    var st = cur();
+    var mount = st && NP_MOUNTS[st.id];
+    if (!mount) return;
+    var forId = st.id;
+    fetch('https://np.tritondigital.com/public/nowplaying?mountName=' + mount + '&numberToFetch=1&eventType=track', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.text() : Promise.reject(r.status); })
+      .then(function (txt) {
+        if (state.current !== forId) return; // ya cambiaste de radio
+        var xml = new DOMParser().parseFromString(txt, 'text/xml');
+        var title = npProp(xml, 'cue_title');
+        var artist = npProp(xml, 'track_artist_name').replace(/\s*,\s*/g, ', ');
+        var cover = npProp(xml, 'track_cover_url').replace(/^http:/i, 'https:');
+        nowPlaying = title ? { id: forId, title: title, artist: artist, cover: cover } : null;
+        renderNow();
+        renderMini();
+        syncMediaSession();
+      })
+      .catch(function () { /* sin datos: se sigue mostrando el eslogan */ });
+  }
+  function startNowPlaying() {
+    stopNowPlaying();
+    var st = cur();
+    if (!st || !NP_MOUNTS[st.id]) return;
+    fetchNowPlaying();
+    npTimer = setInterval(fetchNowPlaying, NP_EVERY);
+  }
+  function stopNowPlaying() { clearInterval(npTimer); npTimer = null; }
+  function renderNow() {
+    var box = $('#now'), st = cur();
+    var show = !state.preview && !!nowPlaying && !!st && nowPlaying.id === st.id &&
+      (state.status === 'playing' || state.status === 'buffering');
+    box.hidden = !show;
+    if (!show) return;
+    $('#nowTitle').textContent = nowPlaying.title;
+    $('#nowArtist').textContent = nowPlaying.artist;
+    var img = $('#nowCover');
+    if (nowPlaying.cover) {
+      if (img.getAttribute('src') !== nowPlaying.cover) { img.hidden = false; img.src = nowPlaying.cover; }
+    } else img.hidden = true;
+  }
+  $('#nowCover').addEventListener('error', function () { this.hidden = true; });
+
   /* ---------- Temporizador de sueño ---------- */
   var sleepTick = null;
   function minutesLeft() { return state.sleepEnd ? Math.max(1, Math.ceil((state.sleepEnd - Date.now()) / 60000)) : null; }
@@ -758,7 +838,13 @@ var STATIONS = [
     try {
       var st = cur();
       if (st && window.MediaMetadata) {
-        navigator.mediaSession.metadata = new MediaMetadata({ title: st.name, artist: st.dial, album: 'Dial Santiago' });
+        var np = nowPlaying && nowPlaying.id === st.id ? nowPlaying : null;
+        navigator.mediaSession.metadata = new MediaMetadata(np ? {
+          title: np.title,
+          artist: (np.artist ? np.artist + ' · ' : '') + st.name,
+          album: 'Dial Santiago',
+          artwork: np.cover ? [{ src: np.cover, sizes: '150x150', type: 'image/jpeg' }] : []
+        } : { title: st.name, artist: st.dial, album: 'Dial Santiago' });
       }
       navigator.mediaSession.playbackState = state.status === 'playing' ? 'playing' : (state.status === 'paused' ? 'paused' : 'none');
     } catch (e) { /* no compatible */ }
@@ -926,7 +1012,7 @@ var STATIONS = [
       default: return true;
     }
   }
-  function norm(s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, ''); }
+  function norm(s) { return String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
   function matchesQuery(st) {
     var q = norm(state.query.trim());
     if (!q) return true;
@@ -1100,6 +1186,7 @@ var STATIONS = [
       if (real.site) status.appendChild(h('a', { class: 'retry', href: real.site, target: '_blank', rel: 'noopener' }, 'Escuchar en su web ↗'));
     }
     renderPlayButton($('#playBtn'), true);
+    renderNow();
   }
   function renderMini() {
     var st = cur();
@@ -1109,7 +1196,8 @@ var STATIONS = [
     $('#miniName').textContent = st.name;
     var ms = $('#miniStatus');
     var live = state.status === 'playing';
-    ms.replaceChildren(h('span', { class: live ? 'live' : null, style: live ? '--live:' + st.color : null }, statusText()));
+    var np = live && nowPlaying && nowPlaying.id === st.id ? ' · ' + nowPlaying.title + (nowPlaying.artist ? ' — ' + nowPlaying.artist : '') : '';
+    ms.replaceChildren(h('span', { class: live ? 'live' : null, style: live ? '--live:' + st.color : null }, statusText()), np);
     renderPlayButton($('#miniPlay'), false);
     updateMiniVisibility();
   }
